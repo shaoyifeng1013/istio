@@ -19,6 +19,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -117,6 +118,7 @@ type Server struct {
 	appProbeClient        map[string]*http.Client
 	statusPort            uint16
 	lastProbeSuccessful   bool
+	probeIsolationSign    bool
 	envoyStatsPort        int
 }
 
@@ -243,6 +245,8 @@ func (s *Server) Run(ctx context.Context) {
 	mux.HandleFunc(`/stats/prometheus`, s.handleStats)
 	mux.HandleFunc(quitPath, s.handleQuit)
 	mux.HandleFunc("/app-health/", s.handleAppProbe)
+	mux.HandleFunc(`/healthz/fail`, s.handleIsolationInstance)
+	log.Info("fail is init")
 
 	// Add the handler for pprof.
 	mux.HandleFunc("/debug/pprof/", s.handlePprofIndex)
@@ -331,9 +335,34 @@ func (s *Server) handlePprofTrace(w http.ResponseWriter, r *http.Request) {
 	pprof.Trace(w, r)
 }
 
+func (s *Server) handleIsolationInstance(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	//先判断是否ready, 不ready不处理
+	err := s.isReady()
+	s.mutex.Lock()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("instance status is already NOT ready: %s", err.Error()), http.StatusServiceUnavailable)
+	} else {
+		if s.probeIsolationSign {
+			http.Error(w, "instance is in isolation ", http.StatusServiceUnavailable)
+		} else {
+			w.WriteHeader(http.StatusOK)
+			s.probeIsolationSign = true
+		}
+	}
+	s.mutex.Unlock()
+
+}
+
 func (s *Server) handleReadyProbe(w http.ResponseWriter, _ *http.Request) {
 	err := s.isReady()
 	s.mutex.Lock()
+	if s.probeIsolationSign {
+		err = errors.New("in isolation")
+	}
 	if err != nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
 
